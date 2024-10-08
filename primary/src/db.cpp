@@ -12,6 +12,7 @@
 //1--no rep   2--WAL   3--PBR     4--ec
 extern int K;
 int BACKUP_MODE;
+#define SEND_INDEX 0
 //1--PBR 2--sync-gc     3---parity_update
 bool isFileExists_stat(std::string& name) {
   struct stat buffer;   
@@ -406,7 +407,7 @@ bool DB::put_impl(const std::string &key, const std::string &value){
         res_ptr->mr[0] = ibv_reg_mr(res_ptr->pd, res_ptr->buf[0], MAX_SGE_SIZE, mr_flags);
 
 
-        #if SEND_INDEX
+        #if SEND_INDEX==1
         static uint32_t flush_count = 0;
         flush_count++;
         if(flush_count%2==0 && backup_node_avail[0] && backup_node_avail[1] &&BACKUP_MODE!=1){
@@ -725,6 +726,9 @@ bool DB::get_from_rocksdb(const std::string &key,uint32_t &sge_id,uint32_t &offs
     auto status = rocksdb_ptr->Get(rocksdb::ReadOptions(), key, &value);
     sge_id = *((uint32_t*)value.data());
     offset_of_sgement = *( (uint32_t*)(value.data()+4 ) );
+    // if(status.ok()==false){
+    //     std::cout<<"get false, key = "<<key<<" sge_id="<<sge_id<<" offset="<<offset_of_sgement<<std::endl;
+    // }
     return status.ok();
 }
 bool DB::get(const std::string &key, std::string &value){

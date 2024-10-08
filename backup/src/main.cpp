@@ -484,9 +484,10 @@ int resources_create_for_client(struct resources *res)
         }
     }
     mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE ;
+    int size_c=128*1024;//MAX_KV_LEN_FROM_CLIENT
     for(int i=0;i<MAX_QP_NUM;i++){
-        res->client_buf[i] = (char *) malloc(MAX_KV_LEN_FROM_CLIENT);
-        res->client_mr[i] = ibv_reg_mr(res->pd, res->client_buf[i], MAX_KV_LEN_FROM_CLIENT, mr_flags);
+        res->client_buf[i] = (char *) malloc(size_c);
+        res->client_mr[i] = ibv_reg_mr(res->pd, res->client_buf[i], size_c, mr_flags);
         if(!res->client_mr[i])
         {
             fprintf(stderr, "ibv_reg_mr failed with mr_flags=0x%x\n", mr_flags);
@@ -546,11 +547,13 @@ void exit(struct resources *res){
     }
 }
 extern int BACKUP_MODE;
+int USE_LRU=0;
 int put_num=0,get_num=0;
 double total_put_time=0,total_get_time=0;
 std::unordered_map<std::string,std::string> read_cache;
+std::mutex read_cache_lock;
 void listen_client_task(struct resources *res,int poll_id){
-    post_receive_client(res,poll_id,poll_id,MAX_KV_LEN_FROM_CLIENT,758);
+    post_receive_client(res,poll_id,poll_id,128*1024,758);
     while(1){
         int poll_result;
         struct ibv_wc wc;
@@ -568,12 +571,12 @@ void listen_client_task(struct resources *res,int poll_id){
             int opcode,key_len,value_len,primary_node_id;
             beg = clock();
             memcpy(&opcode,res->client_buf[poll_id],4);
-            memcpy(&primary_node_id,res->client_buf[poll_id]+4,4);
-            memcpy(&key_len,res->client_buf[poll_id]+8,4);
-            if(primary_node_id>=4){
-                std::cout<<"error!! primary_node_id = "<<primary_node_id<<" ,task_id = "<<poll_id<<std::endl;
-                primary_node_id=poll_id/8;
-            }
+             
+             
+            // if(primary_node_id>=4){
+            //     std::cout<<"error!! primary_node_id = "<<primary_node_id<<" ,task_id = "<<poll_id<<std::endl;
+            //     primary_node_id=poll_id/8;
+            // }
             //assert(primary_node_id<4);
             //std::cout<<"recv a req, op= "<<opcode<<std::endl;
             int status;
@@ -583,71 +586,112 @@ void listen_client_task(struct resources *res,int poll_id){
             else if(opcode == 2){
                 get_num++;
                 static bool is_first_get=true;
-                
+                memcpy(&primary_node_id,res->client_buf[poll_id]+4,4);
+                memcpy(&key_len,res->client_buf[poll_id]+8,4);
                 std::string key(res->client_buf[poll_id]+12,key_len);
                 std::string value;
+                int value_len=0;
                 // if(BACKUP_MODE==2)
                 //     std::cout<<"begin deal sub read "<<std::endl;
-                auto ret = backup_node.db_list[primary_node_id].rocksdb_ptr->Get(rocksdb::ReadOptions(),key,&value);
-                // if(BACKUP_MODE==2)
-                //     std::cout<<"search LSM finish"<<std::endl;
-                status = ret.ok()?0:1;
-                static int fail_count=0;
-                if(!ret.ok())
-                    fail_count++;
-                if(fail_count>0 && fail_count%100==0)
-                    std::cout<<"sub read in backup node fail **&&$$##"<<std::endl;
-                uint32_t sge_id = *((uint32_t*)value.data());
-                uint32_t offset_of_sgement = *( (uint32_t*)(value.data()+4 ) );
-
-                value.clear();
-                uint32_t value_len
+                std::string meta_value;
+                if(BACKUP_MODE==1){
+                    auto ret = backup_node.db_list[primary_node_id].rocksdb_ptr->Get(rocksdb::ReadOptions(),key,&meta_value);
+                    status = ret.ok()?0:1;
+                    uint32_t sge_id = *((uint32_t*)meta_value.data());
+                    uint32_t offset_of_sgement = *( (uint32_t*)(meta_value.data()+4 ) );
                     if(status==0){
                         if(sge_id==backup_node.db_list[primary_node_id].tail_sge_ptr->sge_id){
                             backup_node.db_list[primary_node_id].tail_sge_ptr->get_kv(offset_of_sgement,key,value);
                         }
                         else{
-                            if(BACKUP_MODE==1){
-                                NAM_SGE::read_kv_from_sge_for_backup(primary_node_id,sge_id,offset_of_sgement,key,value);
-                                value_len = value.size();
-                                memcpy(res->client_buf[poll_id],&status,4);
-                                memcpy(res->client_buf[poll_id]+4,&value_len,4);
-                                memcpy(res->client_buf[poll_id]+8,value.data(),value_len);
-                            }
-                            else{
-                                //status=2 means return position information
-                                // status=2;
-                                // value.append((const char*)(&sge_id),4);
-                                // value.append((const char*)(&offset_of_sgement),4);
-                                std::string &value = read_cache[key];
-                                value_len = value.size();
-                                memcpy(res->client_buf[poll_id],&status,4);
-                                memcpy(res->client_buf[poll_id]+4,&value_len,4);
-                                memcpy(res->client_buf[poll_id]+8,value.data(),value_len);
-                            }
-                        }
+                            NAM_SGE::read_kv_from_sge_for_backup(primary_node_id,sge_id,offset_of_sgement,key,value);                           
+                        }      
                     }
-                    
-                end = clock();
+
+                }else if(BACKUP_MODE==2 && USE_LRU==1 || read_cache.size()>0){
+                    read_cache_lock.lock();
+                    auto iter=read_cache.find(key);
+                    if(iter==read_cache.end()){
+                        status=1;
+                    }else{
+                        status=0;
+                        value=iter->second;
+                    }
+                    read_cache_lock.unlock();
+                }else if(BACKUP_MODE==2 && USE_LRU==0){
+                    //sub read
+                    auto ret = backup_node.db_list[primary_node_id].rocksdb_ptr->Get(rocksdb::ReadOptions(),key,&value);
+                    status = ret.ok()?2:1;
+                }else{
+                    std::cout<<"BACKUP_MODE ="<<BACKUP_MODE<<" USE_LRU ="<<USE_LRU<<std::endl;
+                    assert(0);
+                }
+                value_len = value.size();
+                memcpy(res->client_buf[poll_id],&status,4);
+                memcpy(res->client_buf[poll_id]+4,&value_len,4);
+                memcpy(res->client_buf[poll_id]+8,value.data(),value_len); 
                 post_send_client(res,IBV_WR_SEND,poll_id,poll_id,0,8+value_len,780);
                 poll_completion_client(res,poll_id,781);
-                if(is_first_get){
-                    std::cout<<"first deal get ^^^^^^^^"<<std::endl;
-                    std::cout<<"key = "<<key<<" node="<<primary_node_id<<std::endl;
-                    std::cout<<"status = "<<status<<"sge_id ="<<sge_id<<" offset_of_segment="<<offset_of_sgement<<std::endl;
-                    std::cout<<"value = "<<value<<std::endl;
-                    is_first_get=false;
-                }
-                duration = (double)(end - beg)/CLOCKS_PER_SEC;
-                total_get_time += duration;
-                if(get_num>0&&get_num%100000==0)
-                    std::cout<<"avg_deal_get_time="<<total_get_time/get_num<<std::endl;
+                // if(BACKUP_MODE==2)
+                //     std::cout<<"search LSM finish"<<std::endl;
+                
+                // if(!ret.ok())
+                //     fail_count++;
+                // if(fail_count>0 && fail_count%100==0)
+                //     std::cout<<"sub read in backup node fail **&&$$##"<<std::endl;
+                
+
+                // value.clear();
+                // uint32_t value_len;
+                //     if(status==0){
+                //         if(sge_id==backup_node.db_list[primary_node_id].tail_sge_ptr->sge_id){
+                //             backup_node.db_list[primary_node_id].tail_sge_ptr->get_kv(offset_of_sgement,key,value);
+                //         }
+                //         else{
+                //             if(BACKUP_MODE==1){
+                //                 NAM_SGE::read_kv_from_sge_for_backup(primary_node_id,sge_id,offset_of_sgement,key,value);
+                //                 value_len = value.size();
+                //                 memcpy(res->client_buf[poll_id],&status,4);
+                //                 memcpy(res->client_buf[poll_id]+4,&value_len,4);
+                //                 memcpy(res->client_buf[poll_id]+8,value.data(),value_len);
+                //             }
+                //             else{//BACKUP_MODE==2
+                //                 //status=2 means return position information
+                //                 // status=2;
+                //                 // value.append((const char*)(&sge_id),4);
+                //                 // value.append((const char*)(&offset_of_sgement),4);
+                //                 std::string &value = read_cache[key];
+                //                 value_len = value.size();
+                //                 memcpy(res->client_buf[poll_id],&status,4);
+                //                 memcpy(res->client_buf[poll_id]+4,&value_len,4);
+                //                 memcpy(res->client_buf[poll_id]+8,value.data(),value_len);
+                //             }
+                //         }
+                //     }
+                    
+                // end = clock();
+                // post_send_client(res,IBV_WR_SEND,poll_id,poll_id,0,8+value_len,780);
+                // poll_completion_client(res,poll_id,781);
+                // if(is_first_get){
+                //     std::cout<<"first deal get ^^^^^^^^"<<std::endl;
+                //     std::cout<<"key = "<<key<<" node="<<primary_node_id<<std::endl;
+                //     std::cout<<"status = "<<status<<"sge_id ="<<sge_id<<" offset_of_segment="<<offset_of_sgement<<std::endl;
+                //     std::cout<<"value = "<<value<<std::endl;
+                //     is_first_get=false;
+                // }
+                // duration = (double)(end - beg)/CLOCKS_PER_SEC;
+                // total_get_time += duration;
+                // if(get_num>0&&get_num%100000==0)
+                //     std::cout<<"avg_deal_get_time="<<total_get_time/get_num<<std::endl;
             }
             else if(opcode == 3){
                 //evict a set of key
                 int key_num;
                 memcpy(&key_num,res->client_buf[poll_id]+4,4);
+                //std::cout<<"evict a set of key ,num = "<<key_num<<std::endl;
                 int cur_offset=8;
+                int not_exist_count=0;
+                read_cache_lock.lock();
                 for(int i=0;i<key_num;++i){
                     int key_len;
                     memcpy(&key_len,res->client_buf[poll_id]+cur_offset,4);
@@ -655,19 +699,29 @@ void listen_client_task(struct resources *res,int poll_id){
                     std::string key(res->client_buf[poll_id]+cur_offset,key_len);
                     cur_offset+=key_len;
                     auto iter=read_cache.find(key);
-                    read_cache.erase(iter);
+                    if(iter!=read_cache.end())
+                        read_cache.erase(iter);
+                    else{
+                        //std::cout<<"evict not exist, key="<<key<<std::endl;
+                        not_exist_count++;
+                    }
                 }
+                read_cache_lock.unlock();
+                //std::cout<<"evict finish ,not_exist_count="<<not_exist_count<<" now map has element count="<<read_cache.size()<<std::endl;
             }
             else{
                 std::cout<<"error!! ilegal opcode :"<<opcode<<std::endl;
                 
             }
-            post_receive_client(res,poll_id,poll_id,MAX_KV_LEN_FROM_CLIENT,758);
+            post_receive_client(res,poll_id,poll_id,128*1024,758);
         }
     }
 }
+
 int main(int argc, char *argv[])
 {
+    if(BACKUP_MODE==2)
+        read_cache.reserve(500*1024);
     struct resources res;
     uint32_t max_sge_size = MAX_SGE_SIZE;
     
@@ -708,11 +762,12 @@ int main(int argc, char *argv[])
             {.name = "master", .has_arg = 1, .val = 'm' },
             {.name = "extra", .has_arg = 1, .val = 'e' },
             {.name = "extra2", .has_arg = 1, .val = 'E' },
+            {.name = "lru", .has_arg = 1, .val = 'l' },
             {.name = NULL, .has_arg = 0, .val = '\0'}
         };
         /*关于参数设置，gid必须两端都一样, ib-port必须两端等于0
         */
-        c = getopt_long(argc, argv, "p:d:i:g:n:c:m:e:E:b:s", long_options, NULL);
+        c = getopt_long(argc, argv, "p:d:i:g:n:c:m:e:E:b:sl", long_options, NULL);
         if(c == -1)
         {
             break;
@@ -766,6 +821,9 @@ int main(int argc, char *argv[])
         case 'E':
             config.extra_server_name[1] = strdup(optarg);
             break;
+        case 'l':
+            USE_LRU=1;
+        break;
         default:
             usage(argv[0]);
             return 1;
@@ -980,6 +1038,7 @@ void update_parity_task(int poll_id,int segment_id,struct resources *res){
         //std::cout<<"fragement stripe num = "<<max_id-min_id <<" ,total parity_sgement="<<backup_node.parity_sge_num<<" ,gc_rdma_time="<<gc_rdma_time<<std::endl;
     }
 }
+
 std::map<uint32_t,uint32_t> parity_update_map;
 void listen_flush_tail(struct resources *res){
     
@@ -1308,25 +1367,40 @@ void listen_flush_tail(struct resources *res){
                 
                 //std::cout<<"finish msg_type=5"<<std::endl;
             }else if(msg_type==7){
+                //insert new kv pairs into map
+               
                 int key_num;
                 memcpy(&key_num,res->msg_buf[poll_id]+4,4);
-                int cur_offset=8;
+                post_receive_msg(res,poll_id,poll_id,MAX_MSG_SIZE,1316);
+                poll_completion(res,poll_id,1317);
+                //std::cout<<"new push kvs into map,key num= "<<key_num<<std::endl;
+                int cur_offset=0;
                 for(int i=0;i<key_num;++i){
                     int key_len;
+                    //std::cout<<"cur_put num = "<<i<<std::endl;
                     memcpy(&key_len,res->msg_buf[poll_id]+cur_offset,4);
                     cur_offset+=4;
                     std::string key(res->msg_buf[poll_id]+cur_offset,key_len);
                     cur_offset+=key_len;
+                    //std::cout<<"debug p1"<<std::endl;
                     int value_len;
-                    std::string value(res->msg_buf[poll_id]+cur_offset,value_len);
+                    memcpy(&value_len,res->msg_buf[poll_id]+cur_offset,4);
+                    cur_offset+=4;
+                    //std::string value(res->msg_buf[poll_id]+cur_offset,value_len);
+                   
+                    //read_cache[key]=value;
+                    read_cache_lock.lock();
+                    read_cache[key]=std::string(res->msg_buf[poll_id]+cur_offset,value_len);
+                    read_cache_lock.unlock();
                     cur_offset+=value_len;
-                    read_cache[key]=std::move(value);
                 }
+                //std::cout<<"put finish, now elements num = "<<read_cache.size()<<std::endl;
             }
             else{
 
                 std::cout<<"^^^^^error!!!!!!&&&&&&&&msg_type error********"<<std::endl;
                 std::cout<<"msg_type= "<<msg_type<<" from node:"<<poll_id<<std::endl;
+                assert(0);
             }
             post_receive_msg(res,poll_id,poll_id,16,922);
         }

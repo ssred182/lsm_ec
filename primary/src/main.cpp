@@ -13,7 +13,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
-
+#include <unordered_map>
 #include <time.h>
 #include <string>
 #include <vector>
@@ -26,7 +26,7 @@
 #include "define.h"
 #define KV_NUM  10*1024
 #define V_LEN 1024
-#define MAX_KV_LEN_FROM_CLIENT 8*1024
+#define MAX_KV_LEN_FROM_CLIENT 128*1024
 class KV{
     public:
         std::string key;
@@ -173,7 +173,7 @@ int resources_create(struct resources *res,size_t mr_size)
     /* allocate the memory buffer that will hold the data */
 
          res->msg_buf[0] = (char *) malloc(MAX_MSG_SIZE);
-         
+         res->msg_buf[1] = (char *) malloc(MAX_MSG_SIZE);
             res->gc_msg_buf = (char *) malloc(16*1024*1024+16);
          fprintf(stdout, "申请内存msg_buf\n");
         if(!res->msg_buf[0])
@@ -189,6 +189,7 @@ int resources_create(struct resources *res,size_t mr_size)
     mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE ;
         res->mr[0] = ibv_reg_mr(res->pd, res->buf[0], MAX_SGE_SIZE, mr_flags);
         res->msg_mr[0] = ibv_reg_mr(res->pd, res->msg_buf[0], MAX_MSG_SIZE, mr_flags);
+        res->msg_mr[1] = ibv_reg_mr(res->pd, res->msg_buf[1], MAX_MSG_SIZE, mr_flags);
         res->gc_msg_mr = ibv_reg_mr(res->pd, res->gc_msg_buf, 16*1024*1024+16, mr_flags);
         fprintf(stdout, "注册buf内存到pd\n");
         if(!res->mr[0])
@@ -462,9 +463,10 @@ int resources_create_for_client(struct resources *res)
         }
     }
     mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE ;
+    int size_c = 128*1024;//MAX_KV_LEN_FROM_CLIENT
     for(int i=0;i<MAX_QP_NUM;i++){
-        res->client_buf[i] = (char *) malloc(MAX_KV_LEN_FROM_CLIENT);
-        res->client_mr[i] = ibv_reg_mr(res->pd, res->client_buf[i], MAX_KV_LEN_FROM_CLIENT, mr_flags);
+        res->client_buf[i] = (char *) malloc(size_c);
+        res->client_mr[i] = ibv_reg_mr(res->pd, res->client_buf[i], size_c, mr_flags);
         if(!res->client_mr[i])
         {
             fprintf(stderr, "ibv_reg_mr failed with mr_flags=0x%x\n", mr_flags);
@@ -566,10 +568,11 @@ extern double flush_tail_time,send_index_time,rdma_write_time,local_put_sge_time
 int rc = 1;
 DB *test_db;
 extern int BACKUP_MODE;
-int put_num=0,get_num=0;
-double total_put_time=0,total_get_time=0;
+int put_num=0,get_num=0,sub_read_count=0,push_count=0;
+double total_put_time=0,total_get_time=0,sub_read_time=0,push_time=0;
+//std::unordered_map<std::string,std::string> read_cache;
 void listen_client_task(struct resources *res,int poll_id){
-    post_receive_client(res,poll_id,poll_id,MAX_KV_LEN_FROM_CLIENT,758);
+    post_receive_client(res,poll_id,poll_id,128*1024,758);
     while(1){
         int poll_result;
         struct ibv_wc wc;
@@ -618,6 +621,9 @@ void listen_client_task(struct resources *res,int poll_id){
                 std::string key(res->client_buf[poll_id]+8,key_len);
                 std::string value;
                 auto ret = test_db->get(key,value);
+                // if(ret){
+                //     read_cache[key]=value;
+                // }
                 status = ret?0:1;
                 uint32_t value_len = value.size();
                 memcpy(res->client_buf[poll_id],&status,4);
@@ -631,15 +637,97 @@ void listen_client_task(struct resources *res,int poll_id){
                 total_get_time += duration;
                 if(get_num>0&&get_num%100000==0){
                     std::cout<<"avg_deal_get_time="<<total_get_time/get_num<<std::endl;
-                    std::cout<<"key = "<<key<<std::endl;
-                    std::cout<<"value = "<<value<<std::endl;
+                    //std::cout<<"key = "<<key<<std::endl;
+                    //std::cout<<"value = "<<value<<std::endl;
                 }
 
-            }else{
+            }else if(opcode==3){
+                //sub read
+                int sge_id,offset;
+                memcpy(&sge_id,res->client_buf[poll_id]+4,4);
+                memcpy(&offset,res->client_buf[poll_id]+8,4);
+
+                std::string key,value;
+                NAM_SGE::read_kv_from_sge(sge_id,offset,key,value);
+                int status=0;
+                uint32_t value_len = value.size();
+                memcpy(res->client_buf[poll_id],&status,4);
+                memcpy(res->client_buf[poll_id]+4,&value_len,4);
+                memcpy(res->client_buf[poll_id]+8,value.data(),value_len);
+                end = clock();
+                duration = (double)(end - beg)/CLOCKS_PER_SEC;
+                sub_read_time+=duration;
+                sub_read_count++;
+                if(sub_read_count%1000==0){
+                    std::cout<<"avg_deal_subget_time="<<sub_read_time/sub_read_count<<std::endl;
+                }
+                post_send_client(res,IBV_WR_SEND,poll_id,poll_id,0,8+value_len,780);
+                poll_completion_client(res,poll_id,781);
+            }else if(opcode==4){
+                //push kvs to backup for read cache
+                int backup_node_id;
+                int key_num=0;
+                memcpy(&backup_node_id,res->client_buf[poll_id]+4,4);
+                memcpy(&key_num,res->client_buf[poll_id]+8,4);
+                int message_type=7;
+                test_db->rdma_msg_lock[1].lock();
+                memcpy(res->msg_buf[1],&message_type,4);
+                memcpy(res->msg_buf[1]+4,&key_num,4);
+                int offset_c=12;
+                int offset_b=8;
+               
+                for(int i=0;i<key_num;++i){
+                    int key_len;
+
+                    memcpy(&key_len,res->client_buf[poll_id]+offset_c,4);
+                    std::string key(res->client_buf[poll_id]+offset_c+4,key_len);
+                    // if(i%100==0)
+                    //     std::cout<<"key="<<key<<std::endl;
+                    memcpy(res->msg_buf[1]+offset_b,res->client_buf[poll_id]+offset_c,key_len+4);
+                    offset_c+=key_len+4;
+                    
+                    std::string value;
+                    //auto iter=read_cache.find(key);
+                    bool ret;
+                    // if(iter!=read_cache.end()){
+                    //     value=iter->second;
+                    //     read_cache.erase(iter);
+                    // }
+                    // else
+                         ret = test_db->get(key,value);
+                    // if(i%100==0)
+                    //     std::cout<<"val="<<value<<std::endl;
+                    if(ret){
+                        int value_len=value.size();
+                        offset_b+=key_len+4;
+                        memcpy(res->msg_buf[1]+offset_b,&value_len,value_len);
+                        offset_b+=4;
+                        memcpy(res->msg_buf[1]+offset_b,(const char*)value.data(),value_len);
+                        offset_b+=value_len;
+                    }
+                }
+                //std::cout<<"push lru to backup_node_id = "<<backup_node_id<<" recv_msg_len="<<offset_c<<" send_msg_len="<<offset_b<<" kv_num="<<key_num<<std::endl;
+                test_db->rdma_msg_lock[0].lock();
+                //send msg_type and key_num
+                post_send_msg(test_db->res_ptr,IBV_WR_SEND,backup_node_id,1,0,8,683);
+                poll_completion(test_db->res_ptr,backup_node_id,684);
+                //send kvs
+                post_send_msg(test_db->res_ptr,IBV_WR_SEND,backup_node_id,1,8,offset_b-8,698);
+                poll_completion(test_db->res_ptr,backup_node_id,699);
+                test_db->rdma_msg_lock[0].unlock();
+                test_db->rdma_msg_lock[1].unlock();
+                end = clock();
+                duration = (double)(end - beg)/CLOCKS_PER_SEC;
+                push_time+=duration;
+                push_count++;
+                if(push_count%100==0)
+                    std::cout<<"avg push time = "<<push_time/push_count<<std::endl;
+            }
+            else{
                 std::cout<<"error!! ilegal opcode :"<<opcode<<std::endl;
                 
             }
-            post_receive_client(res,poll_id,poll_id,MAX_KV_LEN_FROM_CLIENT,758);
+            post_receive_client(res,poll_id,poll_id,128*1024,758);
         }
     }
 }
@@ -647,6 +735,7 @@ void listen_client_task(struct resources *res,int poll_id){
 
 int main(int argc, char *argv[])
 {
+    //read_cache.reserve(64*1024);
     struct resources res;
     uint32_t max_sge_size = MAX_SGE_SIZE;
     BACKUP_MODE=2;
@@ -767,6 +856,7 @@ int main(int argc, char *argv[])
     //initilize backup_node before create res to prepare sge for buf(MR)
     std::string path = "../rocksdb_lsm";
     test_db = new DB(path,&res,config.node_id);
+    std::cout<<"create rocksdb successfully"<<std::endl;
     if(BACKUP_MODE==2){
         test_db->GC_MODE=1;
     }
@@ -850,84 +940,15 @@ int main(int argc, char *argv[])
         std::thread listen_client_th(listen_client_task,&res,i);
         listen_client_th.detach();
     }
-
-    post_receive_client(&res,0,0,MAX_KV_LEN_FROM_CLIENT,758);
+    listen_client_task(&res,0);
    
-    while(1){
-        int poll_result;
-        struct ibv_wc wc;
-        poll_result = ibv_poll_cq(res.client_cq[0], 1, &wc);
-        if(poll_result < 0)
-        {
-            /* poll CQ failed */
-            fprintf(stderr, "poll CQ failed\n");
-            rc = 1;
-        }else if(poll_result == 0){
-            //
-        }else{
-            clock_t beg,end;
-            double duration;
-            int opcode,key_len,value_len;
-            beg = clock();
-            memcpy(&opcode,res.client_buf[0],4);
-            memcpy(&key_len,res.client_buf[0]+4,4);
-            memcpy(&value_len,res.client_buf[0]+8,4);
-            //std::cout<<"recv a req, op= "<<opcode<<std::endl;
-            int status;
-            if(opcode == 1){
-                put_num++;
-                std::string key(res.client_buf[0]+12,key_len);
-                std::string value(res.client_buf[0]+12+key_len,value_len);
-                //key.assign((const char*)(res.client_buf+12),key_len);
-                //value.assign((const char*)(res.client_buf+12+key_len),value_len);
-                //std::cout<<"key="<<key<<" ,value_len="<<value_len<<std::endl;
-                
-                auto ret = test_db->put(key,value);
-                status = ret?0:1;
-                int finish_flag = 1;
-                memcpy(res.client_buf[0],&finish_flag,4);
-                memcpy(res.client_buf[0],&status,4);
-                end = clock();
-                post_send_client(&res,IBV_WR_SEND,0,0,0,4,780);
-                poll_completion_client(&res,0,781);
-                
-                //std::cout<<"deal finish,reply to client"<<std::endl;
-                
-                duration = (double)(end - beg)/CLOCKS_PER_SEC;
-                total_put_time += duration;
-                if(put_num>0&&put_num%100000==0)
-                    std::cout<<"avg_deal_put_time="<<total_put_time/put_num<<std::endl;
-            }else if(opcode == 2){
-                get_num++;
-                std::string key(res.client_buf[0]+8,key_len);
-                std::string value;
-                auto ret = test_db->get(key,value);
-                status = ret?0:1;
-                uint32_t value_len = value.size();
-                memcpy(res.client_buf[0],&status,4);
-                memcpy(res.client_buf[0]+4,&value_len,4);
-                memcpy(res.client_buf[0]+8,value.data(),value_len);
-                end = clock();
-                post_send_client(&res,IBV_WR_SEND,0,0,0,8+value_len,780);
-                poll_completion_client(&res,0,781);
-                
-                duration = (double)(end - beg)/CLOCKS_PER_SEC;
-                total_get_time += duration;
-                if(get_num>0&&get_num%100000==0)
-                    std::cout<<"avg_deal_get_time="<<total_get_time/get_num<<std::endl;
-
-            }else{
-                std::cout<<"error!! ilegal opcode :"<<opcode<<std::endl;
-                
-            }
-            post_receive_client(&res,0,0,MAX_KV_LEN_FROM_CLIENT,758);
-        }
-    }
+    
+    
     // while(1)
     //     ;
    
     std::cout<<"flush_tail time= "<<flush_tail_time<<std::endl;
-    #if SEND_INDEX
+    #if SEND_INDEX==1
     std::cout<<"send index time= "<<send_index_time<<std::endl;
     #endif
     std::cout<<"rdma write time= "<<rdma_write_time<<std::endl;
