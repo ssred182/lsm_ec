@@ -1,0 +1,5 @@
+If the primary node fails during a GC operation, the
+extra node can obtain GC remaining progress if any and continue the GC operation from the value
+segment with the smallest segment ID after recovery.
+Note that backup nodes will update $D_i$ to $C_i$ for the failed primary node and return its ID
+range of erasure-coded value segments starting from $D_i$ at the beginning of recovery.
